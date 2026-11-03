@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>열쇠 뽑기</title>
+<style>
+  body { font-family: sans-serif; margin: 16px; }
+  #top { display: flex; gap: 16px; align-items: flex-start; flex-wrap: wrap; }
+  #stage { position: relative; width: 700px; max-width: 100%; height: 340px; border: 1px solid #888; overflow: hidden; margin-top: 12px; background: #f4f4f4; }
+  #box { position: absolute; right: 20px; bottom: 0; width: 130px; height: 100px; font-size: 48px; text-align: center; line-height: 100px; border: 3px dashed #a70; background: #fd8; }
+  .key { position: absolute; width: 100px; text-align: center; cursor: grab; touch-action: none; user-select: none; font-size: 13px; z-index: 5; }
+  .key.drag { cursor: grabbing; }
+  #reel { display: none; margin-top: 12px; }
+  #viewport { position: relative; width: 700px; max-width: 100%; height: 280px; overflow: hidden; background: #111; }
+  #marker { position: absolute; left: 50%; top: 0; bottom: 0; width: 3px; margin-left: -1px; background: #f33; z-index: 10; }
+  #strip { display: flex; gap: 10px; align-items: center; height: 100%; will-change: transform; }
+  .card { flex: none; width: 130px; border: 3px solid #888; box-sizing: border-box; background: #222; color: #fff; text-align: center; font-size: 13px; transition: transform .6s, opacity .6s; }
+  .card img { width: 100%; height: 100px; object-fit: cover; display: block; }
+  .g3 { border-color: gold; } .g2 { border-color: #a5f; } .g1 { border-color: #888; }
+  .card.dim { opacity: .2; }
+  .card.win { transform: scale(1.8); opacity: 1; z-index: 3; }
+</style>
+</head>
+<body>
+<h1>열쇠 뽑기</h1>
+
+<p>
+  모델 파일 3개 선택 (model.json, metadata.json, weights.bin):
+  <input id="modelFiles" type="file" multiple accept=".json,.bin">
+  <button id="startBtn">시작</button>
+</p>
+<p id="status" style="color:crimson"></p>
+
+<div id="top">
+  <div id="webcam-container"></div>
+  <div>
+    <div id="label-container"></div>
+    <h2 id="recognized"></h2>
+    <div id="hold"></div>
+  </div>
+</div>
+
+<div id="stage"><div id="box">📦</div></div>
+
+<div id="reel">
+  <div id="viewport"><div id="marker"></div><div id="strip"></div></div>
+  <h2 id="result"></h2>
+  <button id="resetBtn">다시 하기</button>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@1.3.1/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@teachablemachine/image@0.8/dist/teachablemachine-image.min.js"></script>
+
+<script>
+/* ===== 설정 ===== */
+const THRESHOLD = 0.8;     // 일치율 80%
+const HOLD_MS   = 1000;    // 1초 유지
+const P_TOP = 3, P_MID = 10;   // 최고 등급 3%, 2등급 10%, 나머지 87%
+
+// 뽑기 사진 목록. grade: 3 = |000|, 2 = |00|, 1 = |0|
+// src를 비우면 임시 이미지가 만들어져요. 내 사진을 쓰려면 src에 경로를 넣으세요. 예: "images/a.png"
+const ITEMS = [
+  { name: "사진 A", grade: 3, src: "" },
+  { name: "사진 B", grade: 2, src: "" },
+  { name: "사진 C", grade: 2, src: "" },
+  { name: "사진 D", grade: 1, src: "" },
+  { name: "사진 E", grade: 1, src: "" },
+  { name: "사진 F", grade: 1, src: "" },
+  { name: "사진 G", grade: 1, src: "" },
+  { name: "사진 H", grade: 1, src: "" },
+];
+
+/* ===== 공통 ===== */
+const $ = id => document.getElementById(id);
+const gradeText = g => "|" + "0".repeat(g) + "|";
+let model, webcam, maxPredictions, lastPrediction = [];
+let state = "idle";            // idle -> key -> opening -> done
+let holdClass = null, holdSince = 0;
+let key = null;
+
+function setStatus(msg) { $("status").textContent = msg; console.log(msg); }
+
+function placeholder(item) {
+  const c = { 3: "#c9a400", 2: "#7a3fd1", 1: "#555" }[item.grade];
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="130" height="100"><rect width="130" height="100" fill="${c}"/><text x="65" y="56" font-size="20" fill="#fff" text-anchor="middle">${item.name}</text></svg>`;
+  return "data:image/svg+xml;charset=utf-8," + encodeURIComponent(svg);
+}
+
+/* ===== 모델 + 카메라 ===== */
+$("startBtn").addEventListener("click", async () => {
+  setStatus("");
+  try { await start(); } catch (e) { console.error(e); setStatus("오류: " + (e.message || e.name || e)); }
+});
+$("resetBtn").addEventListener("click", resetAll);
+
+function findFiles() {
+  const files = Array.from($("modelFiles").files);
+  const modelFile = files.find(f => f.name === "model.json");
+  const metadataFile = files.find(f => f.name === "metadata.json");
+  const weightsFile = files.find(f => f.name.endsWith(".bin"));
+  const missing = [];
+  if (!modelFile) missing.push("model.json");
+  if (!metadataFile) missing.push("metadata.json");
+  if (!weightsFile) missing.push("weights.bin");
+  if (missing.length) throw new Error("빠진 파일: " + missing.join(", ") + " (3개를 한 번에 함께 선택하세요)");
+  return { modelFile, weightsFile, metadataFile };
+}
+
+async function start() {
+  if (typeof tmImage === "undefined" || typeof tf === "undefined") throw new Error("라이브러리를 불러오지 못했어요. 인터넷 연결을 확인하세요.");
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error("https 또는 localhost 주소로 열어야 카메라를 쓸 수 있어요.");
+  const { modelFile, weightsFile, metadataFile } = findFiles();
+  setStatus("모델 불러오는 중...");
+  model = await tmImage.loadFromFiles(modelFile, weightsFile, metadataFile);
+  maxPredictions = model.getTotalClasses();
+
+  webcam = new tmImage.Webcam(240, 240, true);
+  await webcam.setup();
+  await webcam.play();
+  $("webcam-container").innerHTML = "";
+  $("webcam-container").appendChild(webcam.canvas);
+  $("label-container").innerHTML = "";
+  for (let i = 0; i < maxPredictions; i++) $("label-container").appendChild(document.createElement("div"));
+
+  setStatus("");
+  $("startBtn").disabled = true;
+  requestAnimationFrame(loop);
+  requestAnimationFrame(physics);
+}
+
+async function loop() {
+  webcam.update();
+  lastPrediction = await model.predict(webcam.canvas);
+  lastPrediction.forEach((p, i) => {
+    $("label-container").childNodes[i].textContent = p.className + ": " + (p.probability * 100).toFixed(1) + "%";
+  });
+  checkHold();
+  requestAnimationFrame(loop);
+}
+
+/* ===== 80% 이상 1초 유지 감지 ===== */
+function checkHold() {
+  if (state !== "idle") return;
+  const best = lastPrediction.reduce((a, b) => (a.probability > b.probability ? a : b));
+  if (best.probability >= THRESHOLD) {
+    if (holdClass !== best.className) { holdClass = best.className; holdSince = performance.now(); }
+    const held = performance.now() - holdSince;
+    $("hold").textContent = best.className + " 유지 중 " + (held / 1000).toFixed(1) + "초 / 1초";
+    if (held >= HOLD_MS) onRecognized(best.className);
+  } else {
+    holdClass = null;
+    $("hold").textContent = "인식 대기 중...";
+  }
+}
+
+function onRecognized(name) {
+  state = "key";
+  $("recognized").textContent = "인식됨: " + name;
+  $("hold").textContent = "";
+  spawnKey(name);
+}
+
+/* ===== 열쇠 떨어뜨리기 + 드래그 ===== */
+function spawnKey(name) {
+  const el = document.createElement("div");
+  el.className = "key";
+  const icon = document.createElement("div"); icon.textContent = "🔑"; icon.style.fontSize = "40px";
+  const label = document.createElement("div"); label.textContent = name + " 열쇠";
+  el.append(icon, label);
+  $("stage").appendChild(el);
+
+  const maxX = Math.max(0, $("stage").clientWidth - 260);
+  key = { el, x: Math.random() * maxX, y: -60, vy: 0, dragging: false, dx: 0, dy: 0 };
+  placeKey();
+
+  el.addEventListener("pointerdown", e => {
+    if (state !== "key") return;
+    const s = $("stage").getBoundingClientRect();
+    key.dragging = true; key.vy = 0;
+    key.dx = e.clientX - s.left - key.x;
+    key.dy = e.clientY - s.top - key.y;
+    el.setPointerCapture(e.pointerId);
+    el.classList.add("drag");
+  });
+  el.addEventListener("pointermove", e => {
+    if (!key.dragging) return;
+    const s = $("stage").getBoundingClientRect();
+    key.x = Math.min(Math.max(0, e.clientX - s.left - key.dx), s.width - el.offsetWidth);
+    key.y = Math.min(Math.max(0, e.clientY - s.top - key.dy), s.height - el.offsetHeight);
+    placeKey();
+  });
+  el.addEventListener("pointerup", () => {
+    if (!key.dragging) return;
+    key.dragging = false;
+    el.classList.remove("drag");
+    const a = el.getBoundingClientRect(), b = $("box").getBoundingClientRect();
+    const hit = a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
+    if (hit) openBox();
+  });
+}
+
+function placeKey() { key.el.style.left = key.x + "px"; key.el.style.top = key.y + "px"; }
+
+function physics() {
+  if (key && state === "key" && !key.dragging) {
+    key.vy += 0.6;
+    key.y += key.vy;
+    const floor = $("stage").clientHeight - key.el.offsetHeight;
+    if (key.y >= floor) { key.y = floor; key.vy = 0; }
+    placeKey();
+  }
+  requestAnimationFrame(physics);
+}
+
+/* ===== 상자 열기 + 룰렛 ===== */
+function drawItem() {
+  const r = Math.random() * 100;
+  let tier = r < P_TOP ? 3 : r < P_TOP + P_MID ? 2 : 1;
+  let pool = ITEMS.filter(it => it.grade === tier);
+  while (!pool.length && tier > 1) { tier--; pool = ITEMS.filter(it => it.grade === tier); }
+  if (!pool.length) pool = ITEMS;
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
+function makeCard(item) {
+  const c = document.createElement("div");
+  c.className = "card g" + item.grade;
+  const img = document.createElement("img"); img.src = item.src || placeholder(item);
+  const t = document.createElement("div"); t.textContent = item.name + " " + gradeText(item.grade);
+  c.append(img, t);
+  return c;
+}
+
+function openBox() {
+  state = "opening";
+  key.el.remove(); key = null;
+  $("box").textContent = "📭";
+
+  const TOTAL = 60, WIN = 50, CARD = 130, GAP = 10;
+  const winner = drawItem();
+  const strip = $("strip");
+  strip.innerHTML = ""; strip.style.transition = "none"; strip.style.transform = "translateX(0)";
+  for (let i = 0; i < TOTAL; i++) strip.appendChild(makeCard(i === WIN ? winner : drawItem()));
+  $("result").textContent = "";
+  $("reel").style.display = "block";
+
+  const vw = $("viewport").clientWidth;
+  const jitter = (Math.random() - 0.5) * (CARD - 30);
+  const target = -(WIN * (CARD + GAP) + CARD / 2 + jitter) + vw / 2;
+  void strip.offsetWidth;
+  strip.style.transition = "transform 6s cubic-bezier(0.1, 0.7, 0.15, 1)";
+  strip.style.transform = "translateX(" + target + "px)";
+
+  setTimeout(() => {
+    Array.from(strip.children).forEach((c, i) => c.classList.add(i === WIN ? "win" : "dim"));
+    $("result").textContent = "당첨: " + winner.name + " " + gradeText(winner.grade);
+    state = "done";
+  }, 6200);
+}
+
+function resetAll() {
+  state = "idle"; holdClass = null;
+  $("reel").style.display = "none";
+  $("recognized").textContent = "";
+  $("box").textContent = "📦";
+}
+</script>
+</body>
+</html>
